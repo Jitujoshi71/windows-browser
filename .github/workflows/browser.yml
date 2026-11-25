@@ -1,0 +1,179 @@
+name: Windows Desktop in Browser
+
+# Windows desktop kholo seedha browser me - koi Remote Desktop app nahi chahiye.
+#
+# Kaise kaam karta hai:
+#   TightVNC desktop serve karta hai (localhost:5900)
+#     -> noVNC / websockify use web page bana deta hai (localhost:6080)
+#     -> Cloudflare Tunnel use public link deta hai (https://*.trycloudflare.com)
+# Link browser me kholo, Connect dabao, VNC_PASSWORD daalo - desktop saamne.
+#
+# Setup (ek baar): repo Settings > Secrets and variables > Actions >
+#   New repository secret: VNC_PASSWORD (6-8 characters, sirf letters+digits)
+# Chalana: Actions tab > "Windows Desktop in Browser" > Run workflow.
+# Link run ke logs me aur run summary page par dikhega.
+# Machine zyada se zyada 6 ghante chalti hai, phir run khatam ho jata hai.
+# Har run par link naya banta hai.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  browser-desktop:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check VNC_PASSWORD secret
+        shell: powershell
+        run: |
+          $pw = "${{ secrets.VNC_PASSWORD }}"
+          if (-not $pw) {
+            Write-Error "VNC_PASSWORD secret is not set. Go to repo Settings > Secrets and variables > Actions and add a repository secret named VNC_PASSWORD (6-8 characters, letters and digits only)."
+            exit 1
+          }
+          if ($pw.Length -lt 6) {
+            Write-Error "VNC_PASSWORD must be at least 6 characters (VNC passwords are 6-8 characters)."
+            exit 1
+          }
+          if ($pw.Length -gt 8) {
+            Write-Host "NOTE: VNC only uses the first 8 characters of the password."
+          }
+
+      - name: Disable Sleep, Screen Off & Idle Timeouts
+        shell: powershell
+        run: |
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+      - name: Install pycryptodome (VNC password ke liye)
+        shell: powershell
+        run: python -m pip install -q pycryptodome
+
+      - name: Install TightVNC Server
+        shell: powershell
+        run: |
+          $msi = "$env:TEMP\tightvnc.msi"
+          Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.90/tightvnc-2.8.90-gpl-setup-64bit.msi" -OutFile $msi
+          $msiArgs = "/i `"$msi`" /quiet /norestart ADDLOCAL=`"Server`" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=`"${{ secrets.VNC_PASSWORD }}`""
+          Start-Process msiexec.exe -ArgumentList $msiArgs -Wait
+          Start-Sleep -Seconds 5
+          Get-Service tvnserver -ErrorAction SilentlyContinue | Select-Object Name, Status
+
+      - name: Set VNC password in registry (fallback, agar installer ne na lagaya ho)
+        shell: python
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          import os, subprocess
+          from Crypto.Cipher import DES
+          import winreg
+
+          def bitrev(b):
+              return int('{:08b}'.format(b)[::-1], 2)
+
+          # Fixed VNC key, verified against github.com/KarpelesLab/vncpasswd
+          # (vnckey = {23, 82, 107, 6, 35, 78, 88, 7}).
+          # VNC DES = standard DES-ECB with the key bytes bit-reversed -
+          # verified against the repo's own test vector
+          # (key/plain 0123456789abcdef -> cipher 6e09a37726dd560c).
+          VNCKEY = bytes([23, 82, 107, 6, 35, 78, 88, 7])
+          pw = os.environ['VNC_PASSWORD'].encode()[:8].ljust(8, b'\x00')
+          key = bytes(bitrev(x) for x in VNCKEY)
+          enc = DES.new(key, DES.MODE_ECB).encrypt(pw)
+
+          reg = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\TightVNC\Server', 0, winreg.KEY_SET_VALUE)
+          winreg.SetValueEx(reg, 'Password', 0, winreg.REG_BINARY, enc)
+          winreg.SetValueEx(reg, 'UseVncAuthentication', 0, winreg.REG_DWORD, 1)
+          winreg.CloseKey(reg)
+          print('VNC password written to HKLM\\SOFTWARE\\TightVNC\\Server')
+          subprocess.run(['net', 'stop', 'tvnserver'], capture_output=True)
+          subprocess.run(['net', 'start', 'tvnserver'], capture_output=True)
+          print('tvnserver restarted')
+
+      - name: Test VNC login (password galat ho to yahin fail hoga, link nahi banega)
+        shell: python
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          import os, socket, sys
+          from Crypto.Cipher import DES
+
+          def bitrev(b):
+              return int('{:08b}'.format(b)[::-1], 2)
+
+          pw = os.environ['VNC_PASSWORD'].encode()[:8].ljust(8, b'\x00')
+          key = bytes(bitrev(x) for x in pw)
+
+          s = socket.create_connection(('127.0.0.1', 5900), timeout=15)
+          ver = s.recv(12)
+          assert ver.startswith(b'RFB '), ver
+          s.sendall(b'RFB 003.008\n')
+          n = s.recv(1)[0]
+          types = s.recv(n)
+          assert 2 in types, f'VNC auth not offered, got {list(types)}'
+          s.sendall(bytes([2]))
+          challenge = s.recv(16)
+          assert len(challenge) == 16
+          resp = DES.new(key, DES.MODE_ECB).encrypt(challenge[:8]) + DES.new(key, DES.MODE_ECB).encrypt(challenge[8:])
+          s.sendall(resp)
+          result = int.from_bytes(s.recv(4), 'big')
+          s.close()
+          if result != 0:
+              print('VNC AUTH FAILED - TightVNC ne password accept nahi kiya. Upar install/registry steps ke logs dekho.')
+              sys.exit(1)
+          print('VNC login test PASSED')
+
+      - name: Install noVNC + websockify
+        shell: powershell
+        run: |
+          python -m pip install -q websockify
+          $zip = "$env:TEMP\novnc.zip"
+          Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "C:\noVNC" -Force
+          Start-Process python -ArgumentList "-m websockify --web C:\noVNC\noVNC-1.5.0 6080 localhost:5900" -RedirectStandardOutput "$env:TEMP\websockify.log" -RedirectStandardError "$env:TEMP\websockify-err.log" -NoNewWindow
+          Start-Sleep -Seconds 5
+          $r = Invoke-WebRequest -Uri "http://localhost:6080/vnc.html" -UseBasicParsing -ErrorAction SilentlyContinue
+          if ($r.StatusCode -eq 200) { Write-Host "noVNC is up on http://localhost:6080" } else { Write-Error "noVNC did not start"; Get-Content "$env:TEMP\websockify-err.log"; exit 1 }
+
+      - name: Start Cloudflare Tunnel and print the browser link
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
+          Remove-Item "$env:TEMP\cloudflared.log" -ErrorAction SilentlyContinue
+          Remove-Item "$env:TEMP\cloudflared-err.log" -ErrorAction SilentlyContinue
+          Start-Process "C:\cloudflared.exe" -ArgumentList "tunnel --url http://localhost:6080" -RedirectStandardOutput "$env:TEMP\cloudflared.log" -RedirectStandardError "$env:TEMP\cloudflared-err.log" -NoNewWindow
+          $url = $null
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+            $hit = Select-String -Path "$env:TEMP\cloudflared*.log" -Pattern "https://[a-z0-9-]+\.trycloudflare\.com" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { $url = ([regex]::Match($hit.Line, "https://[a-z0-9-]+\.trycloudflare\.com")).Value; break }
+          }
+          if (-not $url) { Write-Error "Cloudflare Tunnel URL not found. Check the cloudflared logs."; Get-Content "$env:TEMP\cloudflared*.log"; exit 1 }
+          $link = "$url/vnc.html?autoconnect=true&resize=scale"
+          "BROWSER_LINK=$link" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host ""
+          Write-Host "==============================================" -ForegroundColor Green
+          Write-Host "  OPEN THIS LINK IN YOUR BROWSER:" -ForegroundColor Green
+          Write-Host "  $link" -ForegroundColor Cyan
+          Write-Host "  Click Connect, enter your VNC_PASSWORD." -ForegroundColor Green
+          Write-Host "==============================================" -ForegroundColor Green
+          Write-Host ""
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Windows desktop in your browser"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Open this link, click **Connect**, and enter your `VNC_PASSWORD`:"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### [$link]($link)"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "The machine stays up for up to 6 hours. The link is new on every run."
+
+      - name: Keep the machine alive (up to 6 hours)
+        shell: powershell
+        run: |
+          for ($i = 1; $i -le 350; $i++) {
+            Start-Sleep -Seconds 60
+            if ($i % 30 -eq 0) { Write-Host "Desktop still up: $i minutes elapsed. Link: $env:BROWSER_LINK" }
+            else { Write-Host "Desktop active: $i minutes elapsed" }
+          }
