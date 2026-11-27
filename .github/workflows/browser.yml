@@ -215,15 +215,28 @@ jobs:
           $zip = "$env:TEMP\novnc.zip"
           Invoke-WebRequest -Uri "https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.zip" -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath "C:\noVNC" -Force
+          Write-Host "noVNC + websockify installed (services start in the final step, so they stay alive)"
+
+      - name: Download cloudflared
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
+          Write-Host "cloudflared downloaded (tunnel starts in the final step, so it stays alive)"
+
+      - name: Start desktop services + keep the machine alive (up to 6 hours)
+        shell: powershell
+        run: |
+          # GitHub runner step khatam hote hi us step me Start-Process se
+          # chalaye gaye background process maar diye jate hain - isiliye
+          # run 4 me noVNC ek baar 200 dekar band ho gaya aur tunnel ke
+          # peeche kuch nahi bacha (Cloudflare 1033). Isliye websockify
+          # aur cloudflared DONO isi aakhri step me start hote hain jo
+          # 6 ghante tak chalta hai - jab tak ye step chal raha hai, ye
+          # dono bhi zinda rahenge.
           Start-Process python -ArgumentList "-m websockify --web C:\noVNC\noVNC-1.5.0 6080 localhost:5900" -RedirectStandardOutput "$env:TEMP\websockify.log" -RedirectStandardError "$env:TEMP\websockify-err.log" -NoNewWindow
           Start-Sleep -Seconds 5
           $r = Invoke-WebRequest -Uri "http://localhost:6080/vnc.html" -UseBasicParsing -ErrorAction SilentlyContinue
           if ($r.StatusCode -eq 200) { Write-Host "noVNC is up on http://localhost:6080" } else { Write-Error "noVNC did not start"; Get-Content "$env:TEMP\websockify-err.log"; exit 1 }
-
-      - name: Start Cloudflare Tunnel and print the browser link
-        shell: powershell
-        run: |
-          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
           Remove-Item "$env:TEMP\cloudflared.log" -ErrorAction SilentlyContinue
           Remove-Item "$env:TEMP\cloudflared-err.log" -ErrorAction SilentlyContinue
           Start-Process "C:\cloudflared.exe" -ArgumentList "tunnel --url http://localhost:6080" -RedirectStandardOutput "$env:TEMP\cloudflared.log" -RedirectStandardError "$env:TEMP\cloudflared-err.log" -NoNewWindow
@@ -250,12 +263,16 @@ jobs:
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### [$link]($link)"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "The machine stays up for up to 6 hours. The link is new on every run."
-
-      - name: Keep the machine alive (up to 6 hours)
-        shell: powershell
-        run: |
           for ($i = 1; $i -le 350; $i++) {
             Start-Sleep -Seconds 60
-            if ($i % 30 -eq 0) { Write-Host "Desktop still up: $i minutes elapsed. Link: $env:BROWSER_LINK" }
+            if ($i % 30 -eq 0) {
+              $h = Invoke-WebRequest -Uri "http://localhost:6080/vnc.html" -UseBasicParsing -ErrorAction SilentlyContinue
+              if ($h.StatusCode -ne 200) {
+                Write-Host "WARNING: noVNC not responding, restarting websockify..."
+                Start-Process python -ArgumentList "-m websockify --web C:\noVNC\noVNC-1.5.0 6080 localhost:5900" -RedirectStandardOutput "$env:TEMP\websockify.log" -RedirectStandardError "$env:TEMP\websockify-err.log" -NoNewWindow
+                Start-Sleep -Seconds 5
+              }
+              Write-Host "Desktop still up: $i minutes elapsed. Link: $link"
+            }
             else { Write-Host "Desktop active: $i minutes elapsed" }
           }
