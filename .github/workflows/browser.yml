@@ -57,7 +57,7 @@ jobs:
         run: |
           $msi = "$env:TEMP\tightvnc.msi"
           Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.90/tightvnc-2.8.90-gpl-setup-64bit.msi" -OutFile $msi
-          $msiArgs = "/i `"$msi`" /quiet /norestart ADDLOCAL=`"Server`" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=`"${{ secrets.VNC_PASSWORD }}`""
+          $msiArgs = "/i `"$msi`" /quiet /norestart ADDLOCAL=`"Server`" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=`"${{ secrets.VNC_PASSWORD }}`" SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1"
           $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
           if ($proc.ExitCode -ne 0) { Write-Error "TightVNC install failed, msiexec exit code $($proc.ExitCode)"; exit 1 }
           Start-Sleep -Seconds 5
@@ -65,7 +65,7 @@ jobs:
           if (-not $svc) { Write-Error "tvnserver service nahi mili - install theek se nahi hua"; exit 1 }
           $svc | Select-Object Name, Status
 
-      - name: Set VNC password in registry (fallback, agar installer ne na lagaya ho)
+      - name: Set VNC password + loopback in registry (fallback, agar installer ne na lagaya ho)
         shell: python
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
@@ -95,17 +95,25 @@ jobs:
                                winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
           winreg.SetValueEx(reg, 'Password', 0, winreg.REG_BINARY, enc)
           winreg.SetValueEx(reg, 'UseVncAuthentication', 0, winreg.REG_DWORD, 1)
+          # AllowLoopback=1 ZAROORI hai: TightVNC by default khud ki machine se
+          # (127.0.0.1) aane wale connection refuse kar deta hai - "Sorry,
+          # loopback connections are not enabled". Hamara login test bhi aur
+          # websockify (noVNC) bhi localhost se hi connect karte hain, isliye
+          # ye band hota to kuch bhi kaam nahi karta.
+          winreg.SetValueEx(reg, 'AllowLoopback', 0, winreg.REG_DWORD, 1)
           winreg.CloseKey(reg)
-          print('VNC password written to HKLM\SOFTWARE\TightVNC\Server (64-bit view)')
+          print(r'VNC password + loopback written to HKLM\SOFTWARE\TightVNC\Server (64-bit view)')
           # Wapas padh kar verify karo ki password sach me set hua
           reg = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\TightVNC\Server', 0,
                                winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
           val, typ = winreg.QueryValueEx(reg, 'Password')
           uva, _ = winreg.QueryValueEx(reg, 'UseVncAuthentication')
+          alb, _ = winreg.QueryValueEx(reg, 'AllowLoopback')
           winreg.CloseKey(reg)
-          print(f'Verify: Password type={typ} len={len(val)} UseVncAuthentication={uva}')
+          print(f'Verify: Password type={typ} len={len(val)} UseVncAuthentication={uva} AllowLoopback={alb}')
           assert len(val) == 8, 'password value wrong length - server ise password nahi manega'
           assert uva == 1, 'UseVncAuthentication != 1'
+          assert alb == 1, 'AllowLoopback != 1 - server loopback connection refuse karega'
 
           r1 = subprocess.run(['net', 'stop', 'tvnserver'], capture_output=True, text=True)
           print('net stop rc=', r1.returncode, (r1.stdout + r1.stderr).strip()[-300:])
@@ -173,7 +181,7 @@ jobs:
                       raw = recvn(s, 4)
                       rlen = int.from_bytes(raw, 'big') if len(raw) == 4 else 0
                       reason = recvn(s, rlen).decode('utf-8', 'replace') if rlen else ''
-                      raise RuntimeError(f'server ne connection refuse kiya. Reason: {reason!r} (password set nahi hua hoga ya service theek se restart nahi hui)')
+                      raise RuntimeError(f'server ne connection refuse kiya. Reason: {reason!r}')
                   types = recvn(s, n)
                   assert 2 in types, f'VNC auth not offered, got {list(types)}'
                   s.sendall(bytes([2]))
