@@ -58,16 +58,19 @@ jobs:
           $msi = "$env:TEMP\tightvnc.msi"
           Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.90/tightvnc-2.8.90-gpl-setup-64bit.msi" -OutFile $msi
           $msiArgs = "/i `"$msi`" /quiet /norestart ADDLOCAL=`"Server`" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=`"${{ secrets.VNC_PASSWORD }}`""
-          Start-Process msiexec.exe -ArgumentList $msiArgs -Wait
+          $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { Write-Error "TightVNC install failed, msiexec exit code $($proc.ExitCode)"; exit 1 }
           Start-Sleep -Seconds 5
-          Get-Service tvnserver -ErrorAction SilentlyContinue | Select-Object Name, Status
+          $svc = Get-Service tvnserver -ErrorAction SilentlyContinue
+          if (-not $svc) { Write-Error "tvnserver service nahi mili - install theek se nahi hua"; exit 1 }
+          $svc | Select-Object Name, Status
 
       - name: Set VNC password in registry (fallback, agar installer ne na lagaya ho)
         shell: python
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          import os, subprocess
+          import os, subprocess, sys, time, socket
           from Crypto.Cipher import DES
           import winreg
 
@@ -84,13 +87,49 @@ jobs:
           key = bytes(bitrev(x) for x in VNCKEY)
           enc = DES.new(key, DES.MODE_ECB).encrypt(pw)
 
-          reg = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\TightVNC\Server', 0, winreg.KEY_SET_VALUE)
+          # KEY_WOW64_64KEY zaroori hai: agar python 32-bit hota to bina iske
+          # password WOW6432Node me likha jata aur 64-bit tvnserver use
+          # dekhta hi nahi - phir server bina password ke connection refuse
+          # karta hai (0 security types).
+          reg = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\TightVNC\Server', 0,
+                               winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
           winreg.SetValueEx(reg, 'Password', 0, winreg.REG_BINARY, enc)
           winreg.SetValueEx(reg, 'UseVncAuthentication', 0, winreg.REG_DWORD, 1)
           winreg.CloseKey(reg)
-          print('VNC password written to HKLM\\SOFTWARE\\TightVNC\\Server')
-          subprocess.run(['net', 'stop', 'tvnserver'], capture_output=True)
-          subprocess.run(['net', 'start', 'tvnserver'], capture_output=True)
+          print('VNC password written to HKLM\SOFTWARE\TightVNC\Server (64-bit view)')
+          # Wapas padh kar verify karo ki password sach me set hua
+          reg = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\TightVNC\Server', 0,
+                               winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+          val, typ = winreg.QueryValueEx(reg, 'Password')
+          uva, _ = winreg.QueryValueEx(reg, 'UseVncAuthentication')
+          winreg.CloseKey(reg)
+          print(f'Verify: Password type={typ} len={len(val)} UseVncAuthentication={uva}')
+          assert len(val) == 8, 'password value wrong length - server ise password nahi manega'
+          assert uva == 1, 'UseVncAuthentication != 1'
+
+          r1 = subprocess.run(['net', 'stop', 'tvnserver'], capture_output=True, text=True)
+          print('net stop rc=', r1.returncode, (r1.stdout + r1.stderr).strip()[-300:])
+          time.sleep(2)
+          r2 = subprocess.run(['net', 'start', 'tvnserver'], capture_output=True, text=True)
+          print('net start rc=', r2.returncode, (r2.stdout + r2.stderr).strip()[-300:])
+          if r2.returncode != 0:
+              print('WARNING: tvnserver start failed, ek baar aur try kar rahe hain...')
+              time.sleep(3)
+              r2 = subprocess.run(['net', 'start', 'tvnserver'], capture_output=True, text=True)
+              print('net start retry rc=', r2.returncode, (r2.stdout + r2.stderr).strip()[-300:])
+              if r2.returncode != 0:
+                  print('ERROR: tvnserver service start nahi hui'); sys.exit(1)
+          # Port 5900 sunne lage tab tak wait karo
+          for i in range(30):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 5900), timeout=2)
+                  s.close()
+                  print(f'Port 5900 listening after {i + 1}s')
+                  break
+              except OSError:
+                  time.sleep(1)
+          else:
+              print('ERROR: port 5900 kabhi khula hi nahi - tvnserver theek se start nahi hua'); sys.exit(1)
           print('tvnserver restarted')
 
       - name: Test VNC login (password galat ho to yahin fail hoga, link nahi banega)
@@ -98,33 +137,68 @@ jobs:
         env:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
-          import os, socket, sys
+          import os, socket, sys, time
           from Crypto.Cipher import DES
 
           def bitrev(b):
               return int('{:08b}'.format(b)[::-1], 2)
 
+          def recvn(s, n):
+              data = b''
+              while len(data) < n:
+                  chunk = s.recv(n - len(data))
+                  if not chunk:
+                      break
+                  data += chunk
+              return data
+
           pw = os.environ['VNC_PASSWORD'].encode()[:8].ljust(8, b'\x00')
           key = bytes(bitrev(x) for x in pw)
 
-          s = socket.create_connection(('127.0.0.1', 5900), timeout=15)
-          ver = s.recv(12)
-          assert ver.startswith(b'RFB '), ver
-          s.sendall(b'RFB 003.008\n')
-          n = s.recv(1)[0]
-          types = s.recv(n)
-          assert 2 in types, f'VNC auth not offered, got {list(types)}'
-          s.sendall(bytes([2]))
-          challenge = s.recv(16)
-          assert len(challenge) == 16
-          resp = DES.new(key, DES.MODE_ECB).encrypt(challenge[:8]) + DES.new(key, DES.MODE_ECB).encrypt(challenge[8:])
-          s.sendall(resp)
-          result = int.from_bytes(s.recv(4), 'big')
-          s.close()
-          if result != 0:
-              print('VNC AUTH FAILED - TightVNC ne password accept nahi kiya. Upar install/registry steps ke logs dekho.')
+          last_err = None
+          for attempt in range(6):
+              s = None
+              try:
+                  s = socket.create_connection(('127.0.0.1', 5900), timeout=15)
+                  ver = recvn(s, 12)
+                  assert ver.startswith(b'RFB '), f'bad version: {ver!r}'
+                  s.sendall(b'RFB 003.008\n')
+                  nbyte = recvn(s, 1)
+                  if not nbyte:
+                      raise RuntimeError('server ne version ke baad connection band kar di (service abhi restart ho rahi hogi)')
+                  n = nbyte[0]
+                  if n == 0:
+                      # RFB 3.8: 0 types = server connection refuse kar raha
+                      # hai, uske baad 4-byte reason length + reason string aati hai
+                      raw = recvn(s, 4)
+                      rlen = int.from_bytes(raw, 'big') if len(raw) == 4 else 0
+                      reason = recvn(s, rlen).decode('utf-8', 'replace') if rlen else ''
+                      raise RuntimeError(f'server ne connection refuse kiya. Reason: {reason!r} (password set nahi hua hoga ya service theek se restart nahi hui)')
+                  types = recvn(s, n)
+                  assert 2 in types, f'VNC auth not offered, got {list(types)}'
+                  s.sendall(bytes([2]))
+                  challenge = recvn(s, 16)
+                  assert len(challenge) == 16, f'short challenge: {len(challenge)}'
+                  resp = DES.new(key, DES.MODE_ECB).encrypt(challenge[:8]) + DES.new(key, DES.MODE_ECB).encrypt(challenge[8:])
+                  s.sendall(resp)
+                  result = int.from_bytes(recvn(s, 4), 'big')
+                  if result != 0:
+                      print('VNC AUTH FAILED - TightVNC ne password accept nahi kiya. Upar install/registry steps ke logs dekho.')
+                      sys.exit(1)
+                  print('VNC login test PASSED')
+                  break
+              except Exception as e:
+                  last_err = e
+                  print(f'Attempt {attempt + 1}/6 failed: {e}')
+                  if s is not None:
+                      try:
+                          s.close()
+                      except Exception:
+                          pass
+                  time.sleep(10)
+          else:
+              print(f'VNC login test FAILED after retries: {last_err}')
               sys.exit(1)
-          print('VNC login test PASSED')
 
       - name: Install noVNC + websockify
         shell: powershell
